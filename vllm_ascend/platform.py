@@ -101,6 +101,9 @@ class NPUPlatform(Platform):
         "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
     ]
     dispatch_key: str = "PrivateUse1"
+    # Set in check_and_update_config(); when true, ACL graph pools are backed by
+    # CaMem so sleep can unmap/remap them instead of destroying the graphs.
+    _sleep_graph_pool_enabled: bool = False
 
     supported_quantization: list[str] = [
         ASCEND_QUANTIZATION_METHOD,
@@ -146,6 +149,29 @@ class NPUPlatform(Platform):
         # ModelConfig validation runs before custom-op init, so avoid importing
         # the extension and just declare support.
         return True
+
+    def get_global_graph_pool(self) -> Any:
+        """Return the ACL graph pool used by capture.
+
+        With sleep mode enabled, captures are routed into the CaMem graph pool
+        so ``sleep()`` can unmap its physical pages and ``wake_up()`` can remap
+        them at the same virtual addresses. This keeps captured graphs valid
+        across sleep cycles instead of destroying and recapturing them.
+        """
+        cls = self.__class__
+        # Upstream memory profiling swaps in a throwaway pool and restores this
+        # attribute afterwards; honour that indirection.
+        if cls._global_graph_pool is not None:
+            return cls._global_graph_pool
+        if cls._sleep_graph_pool_enabled:
+            from vllm_ascend.device_allocator.camem import CaMemAllocator, camem_available
+
+            if camem_available:
+                pool_id = CaMemAllocator.get_instance().get_or_create_graph_pool_id()
+                if pool_id is not None:
+                    cls._global_graph_pool = pool_id
+                    return pool_id
+        return super().get_global_graph_pool()
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -583,6 +609,9 @@ class NPUPlatform(Platform):
 
         # 10.Set pytorch NPU allocator env (vllm_config)
         _set_pytorch_npu_alloc_env(vllm_config)
+
+        # 11.Route ACL graph captures into the CaMem graph pool in sleep mode
+        cls._sleep_graph_pool_enabled = bool(vllm_config.model_config.enable_sleep_mode)
 
     @classmethod
     def set_additional_forward_context(

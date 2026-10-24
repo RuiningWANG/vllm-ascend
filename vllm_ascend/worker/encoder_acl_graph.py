@@ -362,9 +362,12 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         values = capture_inputs.values
 
         graph = torch.npu.NPUGraph()
+        from vllm_ascend.device_allocator import camem
+
         with (
             set_encoder_forward_context(token_budget, True, path=path, axis_keys=axis_keys),
             torch.inference_mode(),
+            camem.capture_context(self.graph_pool),
             torch.npu.graph(graph, self.graph_pool),
         ):
             output = weak_ref_tensors(self.model.encoder_cudagraph_forward(dict(values), path=path))

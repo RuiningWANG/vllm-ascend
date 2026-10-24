@@ -30,6 +30,12 @@ from vllm.device_allocator.cumem import CuMemAllocator
 from vllm.logger import logger
 from vllm.utils.system_utils import find_loaded_library
 
+CUDAGRAPH_TAG = "cudagraph"
+# Tags that may legitimately stay discarded/asleep after a partial wake_up.
+# Every other tag is restored unconditionally so graph replay never reads
+# unmapped memory (upstream vLLM DEFERRABLE_TAGS semantics).
+DEFERRABLE_TAGS = ("weights", "kv_cache")
+
 camem_available = False
 try:
     from vllm_ascend.vllm_ascend_C import (  # type: ignore # noqa: F401
@@ -63,6 +69,34 @@ def get_pluggable_allocator(
     init_module(python_malloc_fn, python_free_func)
     new_alloc = torch.npu.memory.NPUPluggableAllocator(lib_name, "my_malloc", "my_free")
     return new_alloc
+
+
+def _pool_key(pool_id: Any) -> Any:
+    return tuple(pool_id) if isinstance(pool_id, tuple) else pool_id
+
+
+def _empty_cache() -> None:
+    """torch_npu 2.10.0.post4/post7 do not implement the accelerator variant.
+
+    ``torch.accelerator.empty_cache()`` raises
+    ``Allocator for npu is not a DeviceAllocator`` because torch_npu keeps its
+    own caching allocator; fall back to the npu-specific entry point.
+    """
+    try:
+        torch.accelerator.empty_cache()
+    except RuntimeError:
+        torch.npu.empty_cache()
+
+
+@contextmanager
+def capture_context(pool_id: Any | None):
+    """No-op unless ``pool_id`` is the CaMem graph pool created for sleep mode."""
+    instance = CaMemAllocator.instance
+    if instance is None or not instance.graph_pool_active:
+        yield
+        return
+    with instance.capture_context(pool_id):
+        yield
 
 
 @contextmanager
@@ -136,10 +170,71 @@ class CaMemAllocator(CuMemAllocator):
         super().__init__()
         self.current_tag: str = CaMemAllocator.default_tag
         self.allocator_and_pools: dict[str, Any] = {}
+        self._graph_pool: tuple[torch.npu.memory.MemPool, Any] | None = None
+        self._graph_pool_callbacks: tuple[Callable[[HandleType], None], Callable[[int], HandleType]] | None = None
+
+    @property
+    def graph_pool_active(self) -> bool:
+        return self._graph_pool is not None
+
+    def get_or_create_graph_pool_id(self) -> Any | None:
+        """Return the id of the MemPool that ACL graph captures must use."""
+        if self._graph_pool is None:
+            # init_module() stores borrowed references to these callbacks, so
+            # they must outlive the allocator (a temporary bound method would
+            # be collected and later crash my_malloc).
+            malloc_cb = self.python_malloc_callback
+            free_cb = self.python_free_callback
+            alloc = get_pluggable_allocator(malloc_cb, free_cb)
+            mem_pool = torch.npu.memory.MemPool(alloc._allocator)
+            self._graph_pool = (mem_pool, alloc)
+            self._graph_pool_callbacks = (malloc_cb, free_cb)
+            self.allocator_and_pools[CUDAGRAPH_TAG] = (mem_pool, alloc)
+            logger.info("Created CaMem ACL graph pool id=%s", mem_pool.id)
+        return self._graph_pool[0].id
+
+    @contextmanager
+    def capture_context(self, pool_id: Any | None):
+        """Route allocations made by ``torch.npu.graph(pool=pool_id)`` into the
+        CaMem graph pool and tag them as ``cudagraph``."""
+        if (
+            pool_id is None
+            or self._graph_pool is None
+            or _pool_key(pool_id) != _pool_key(self._graph_pool[0].id)
+        ):
+            yield
+            return
+
+        old_tag = self.current_tag
+        self.current_tag = CUDAGRAPH_TAG
+        # torch_npu <= 2.10.0.post4 only calls the pool's custom allocator
+        # while a MemPoolContext is active; newer builds route by owner pool.
+        mempool_ctx = getattr(torch.npu.memory, "MemPoolContext", None)
+        ctx = mempool_ctx(self._graph_pool[0]) if mempool_ctx is not None else None
+        try:
+            yield
+        finally:
+            del ctx
+            self.current_tag = old_tag
+
+    @staticmethod
+    def sleep_offload_tags(level: int) -> tuple[str, ...]:
+        """Tags backed up to host memory before sleep.
+
+        The graph pool is backed up at every level: replaying a graph whose
+        static buffers were discarded is only safe while every kernel
+        overwrites them, which cannot be guaranteed in general.
+        """
+        if level == 1:
+            return ("weights", CUDAGRAPH_TAG)
+        return (CUDAGRAPH_TAG,)
 
     def release_pools(self) -> None:
         """Drop Python references to MemPool/pluggable allocators eagerly."""
-        if not self.allocator_and_pools:
+        graph_pool = self._graph_pool
+        self._graph_pool = None
+        self._graph_pool_callbacks = None
+        if not self.allocator_and_pools and graph_pool is None:
             return
 
         pool_entries = list(self.allocator_and_pools.values())
@@ -147,6 +242,9 @@ class CaMemAllocator(CuMemAllocator):
 
         mem_pools = [entry[0] for entry in pool_entries]
         allocators = [entry[1] for entry in pool_entries]
+        if graph_pool is not None:
+            mem_pools.append(graph_pool[0])
+            allocators.append(graph_pool[1])
         pool_entries.clear()
 
         # Phase 1: drop MemPool refs while allocators are still strongly held.
@@ -201,6 +299,13 @@ class CaMemAllocator(CuMemAllocator):
             len(self.pointer_to_data),
             offload_tags,
         )
+        graph_entries = [d for d in self.pointer_to_data.values() if d.tag == CUDAGRAPH_TAG]
+        if graph_entries:
+            logger.info(
+                "CaMem sleep: %d ACL graph allocations (%.3f GiB) are in the CaMem graph pool",
+                len(graph_entries),
+                sum(d.handle[1] for d in graph_entries) / 1024**3,
+            )
         # Workaround for verl v0.8.0: synchronize pending NPU work before
         # unmapping tensor memory. The exact root cause is unclear, but this
         # avoids rtMemcpy errors observed when releasing the mappings too early.
@@ -275,9 +380,14 @@ class CaMemAllocator(CuMemAllocator):
         All data that is previously offloaded will be loaded back to GPU
         memory, and the rest of the data will have empty memory."""
         gc.collect()
-        torch.accelerator.empty_cache()
+        _empty_cache()
 
-        restore_count = sum(1 for data in self.pointer_to_data.values() if tags is None or data.tag in tags)
+        def should_restore(data) -> bool:
+            # Non-deferrable tags (e.g. the ACL graph pool) must always come
+            # back; a partially woken graph pool would replay unmapped memory.
+            return tags is None or data.tag in tags or data.tag not in DEFERRABLE_TAGS
+
+        restore_count = sum(1 for data in self.pointer_to_data.values() if should_restore(data))
         logger.info(
             "CaMem wake_up: restoring %s/%s allocations (tags=%s)",
             restore_count,
@@ -287,7 +397,7 @@ class CaMemAllocator(CuMemAllocator):
         for ptr, data in self.pointer_to_data.items():
             if not data.is_asleep:
                 continue
-            if tags is None or data.tag in tags:
+            if should_restore(data):
                 handle = data.handle
                 create_and_map(handle)
                 data.is_asleep = False

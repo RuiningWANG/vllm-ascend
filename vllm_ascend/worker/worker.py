@@ -221,6 +221,13 @@ class NPUWorker(WorkerBase):
         # Buffers and parameters saved before sleep.
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self._sleep_saved_parameters: dict[str, torch.Tensor] = {}
+        # Worker processes may be spawned, so the platform class flag set in
+        # check_and_update_config() (engine process) is not inherited here.
+        type(current_platform)._sleep_graph_pool_enabled = bool(vllm_config.model_config.enable_sleep_mode)
+        if type(current_platform)._sleep_graph_pool_enabled:
+            # Discard a plain handle cached before the flag was known; no graph
+            # has been captured yet at this point.
+            type(current_platform)._global_graph_pool = None
         self.sleep_wakeup_manager = SleepWakeupManager(vllm_config, self, lambda: getattr(self, "model_runner", None))
 
         # Weight transfer engine is created in `load_model` once the model
@@ -327,13 +334,19 @@ class NPUWorker(WorkerBase):
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
         rl_config = get_ascend_config().rl_config
-        cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+        cleanup_requested = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+        allocator = CaMemAllocator.get_instance()
+        cleanup_enabled = cleanup_requested and not allocator.graph_pool_active
+        if cleanup_requested and allocator.graph_pool_active:
+            logger.warning(
+                "Skipping sleep_mode_extra_cleanup: ACL graphs live in the CaMem graph pool and "
+                "survive sleep by unmap/remap. Destroying HCCL groups or recapturing would invalidate them."
+            )
         if cleanup_enabled:
             self.sleep_wakeup_manager.sleep()
         self.synchronize_device()
 
-        allocator = CaMemAllocator.get_instance()
-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+        allocator.sleep(offload_tags=CaMemAllocator.sleep_offload_tags(level))
         free_bytes_after_sleep, total = torch.npu.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         used_bytes = total - free_bytes_after_sleep
@@ -371,8 +384,12 @@ class NPUWorker(WorkerBase):
             self._sleep_saved_buffers = {}
 
         rl_config = get_ascend_config().rl_config
-        cleanup_enabled = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
-        if cleanup_enabled:
+        cleanup_requested = rl_config.enabled and rl_config.sleep_mode_extra_cleanup
+        if cleanup_requested and CaMemAllocator.get_instance().graph_pool_active:
+            logger.warning(
+                "Skipping sleep_mode_extra_cleanup on wake: CaMem graph pool graphs were never invalidated."
+            )
+        elif cleanup_requested:
             self.sleep_wakeup_manager.wakeup(tags)
         self.synchronize_device()
 
