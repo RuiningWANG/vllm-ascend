@@ -201,8 +201,18 @@ def torch_npu_graph_wrapper(*args, **kwargs):
     # without adding another upstream monkey patch.
     enable_super_kernel = get_ascend_config().ascend_compilation_config.enable_super_kernel
     graph = args[0] if args else (kwargs.get("cuda_graph") or kwargs.get("graph"))
+    # Upstream passes the pool either as `pool=` or as the second positional
+    # argument; route its allocations into the CaMem graph pool when it is the
+    # one created for sleep mode.
+    pool = kwargs.get("pool", args[1] if len(args) > 1 else None)
+    from vllm_ascend.device_allocator import camem
+
     try:
-        with torch.npu.graph(*args, **kwargs), super_kernel_scope("full_model", enable_super_kernel):
+        with (
+            camem.capture_context(pool),
+            torch.npu.graph(*args, **kwargs),
+            super_kernel_scope("full_model", enable_super_kernel),
+        ):
             yield
         if enable_super_kernel and graph is not None:
             graph.super_kernel_optimize(

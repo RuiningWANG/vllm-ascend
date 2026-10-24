@@ -207,7 +207,12 @@ class ACLGraphWrapper:
                 get_offloader().sync_prev_onload()
                 forward_context.capturing = True
                 try:
-                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                    from vllm_ascend.device_allocator import camem
+
+                    # Resolve at capture time: wrappers built during memory
+                    # profiling would otherwise keep the throwaway pool.
+                    graph_pool = current_platform.get_global_graph_pool()
+                    with camem.capture_context(graph_pool), torch.npu.graph(aclgraph, pool=graph_pool):
                         # `output` is managed by pytorch's aclgraph pool
                         with super_kernel_scope("full_model", self.enable_super_kernel):
                             output = self.runnable(*args, **kwargs)
